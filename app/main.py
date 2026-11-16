@@ -29,13 +29,17 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="VCF 变异归一化服务",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
     description=(
         "面向测序中心数据员的跨批次变异归一化 API。\n\n"
         "**流程**：创建数据集 → 上传单染色体 FASTA + 双等位 SNV/插入/缺失 VCF（生成暂存任务）→ "
         "按查询所得版本号发布（乐观锁整体替换）。\n\n"
         "**归一化**：逐条核对 REF → 消去共有前后缀 → 保留锚点 → 串联重复左对齐 → 归并等价位点（保留各原始行号）。\n\n"
+        "**基因型**：继续接受无样本 VCF；单样本 VCF（头行含 FORMAT + 一个样本列）读取二倍体 GT"
+        "（0/0、0/1、1/0、1/1、./.，1/0 归一为 0/1）。归并到同一位点的行 GT 冲突则整项任务失败，"
+        "不会用后读行覆盖。发布时样本名、GT 与位点随版本一起切换；GT 为 null 表示未知"
+        "（无样本列、源行 ./. 或旧版本数据），不会推定为 0/0。\n\n"
         "**一致性**：处理期间查询仍返回完整旧版；并发发布仅版本匹配者成功；坏行或发布失败不改动旧版。"
     ),
 )
@@ -87,7 +91,7 @@ async def upload(
     dataset_id: int,
     request: Request,
     fasta: UploadFile = File(..., description="单染色体 FASTA"),
-    vcf: UploadFile = File(..., description="仅含双等位 SNV/插入/缺失的 VCF"),
+    vcf: UploadFile = File(..., description="仅含双等位 SNV/插入/缺失的 VCF；无样本或单样本（FORMAT 含 GT）"),
 ):
     fasta_bytes = await fasta.read()
     vcf_bytes = await vcf.read()
@@ -100,7 +104,7 @@ async def upload(
         raise HTTPException(status_code=400, detail="文件必须为 UTF-8 文本")
 
     try:
-        chrom, total, variants, errors = process_upload(fasta_text, vcf_text)
+        chrom, sample_name, total, variants, errors = process_upload(fasta_text, vcf_text)
     except ParseError as exc:
         raise HTTPException(status_code=400, detail=f"文件解析失败：{exc}")
 
@@ -109,6 +113,7 @@ async def upload(
             dataset_id,
             fasta.filename or "ref.fa",
             vcf.filename or "variants.vcf",
+            sample_name,
             chrom,
             total,
             errors,

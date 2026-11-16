@@ -12,6 +12,13 @@ class VariantOut(BaseModel):
     pos: int = Field(description="归一化后的 1-based 坐标")
     ref: str = Field(description="归一化后的 REF")
     alt: str = Field(description="归一化后的 ALT")
+    gt: str | None = Field(
+        default=None,
+        description=(
+            "该位点的二倍体基因型（0/0、0/1、1/1；1/0 已归一为 0/1）。"
+            "null 表示未知：无样本列的上传、源行 ./. 或旧版本数据，不会推定为 0/0"
+        ),
+    )
     lines: list[int] = Field(description="归并到该位点的所有原始 VCF 行号（含头部行计数，从 1 起）")
 
 
@@ -20,6 +27,9 @@ class DatasetOut(BaseModel):
     name: str
     version: int = Field(description="当前已发布版本，0 表示尚未发布")
     published_job_id: int | None
+    sample_name: str | None = Field(
+        default=None, description="当前已发布版本的样本名（单样本 VCF 的样本列名），随版本一起切换；无样本或未发布时为 null"
+    )
     created_at: str
     updated_at: str
 
@@ -42,9 +52,10 @@ class RowErrorOut(BaseModel):
 class JobOut(BaseModel):
     id: int
     dataset_id: int
-    status: str = Field(description="ready=可发布；failed=含坏行，不可发布")
+    status: str = Field(description="ready=可发布；failed=含坏行（含 GT 冲突），不可发布")
     fasta_name: str
     vcf_name: str
+    sample_name: str | None = Field(default=None, description="单样本 VCF 的样本列名；无样本 VCF 为 null")
     chrom: str | None
     total_records: int = Field(description="VCF 数据行总数")
     bad_count: int = Field(description="坏行数")

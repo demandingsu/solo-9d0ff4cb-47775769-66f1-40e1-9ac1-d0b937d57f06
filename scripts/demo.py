@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""端到端演示：等价变异归并、版本乐观锁、坏行隔离。
+"""端到端演示：等价变异归并、版本乐观锁、坏行隔离、单样本基因型（GT）。
 
 用法：
     python3 scripts/demo.py [BASE_URL]     # 默认 http://localhost:8000
@@ -123,6 +123,63 @@ def main():
     print("\n演示完成：等价变异已归并，坏行与版本冲突均未影响已发布数据。")
 
 
+def demo_genotype():
+    """单样本 GT：读取/归一/冲突失败/随版本切换。"""
+    global DATASET_ID
+
+    status, ds = req("POST", "/datasets", {"name": "demo-单样本基因型"})
+    show("12. 创建基因型演示数据集", status, ds)
+    DATASET_ID = ds["id"]
+
+    status, job = upload("sample1.vcf")
+    show("13. 上传单样本 VCF（样本 NA001；行 7 的 1/0 与行 6 的 0/1 视为相同并归并）",
+         status, job)
+    assert job["status"] == "ready" and job["sample_name"] == "NA001"
+
+    status, pub = req("POST", f"/datasets/{DATASET_ID}/publish",
+                      {"job_id": job["id"], "expected_version": 0})
+    show("14. 发布 v0 -> v1（样本名、GT、位点随版本一起切换）", status, pub)
+
+    status, d = req("GET", f"/datasets/{DATASET_ID}")
+    show("15. 查询 v1：sample_name=NA001，各位点带 GT（./. 与无样本均为 null=未知）",
+         status, d)
+    gts = {(v["pos"], v["ref"], v["alt"]): v["gt"] for v in d["variants"]}
+    assert d["sample_name"] == "NA001"
+    assert gts[(4, "G", "GTA")] == "0/1"    # 1/0 已归一为 0/1
+    assert gts[(18, "T", "G")] is None      # 源行 ./. -> 未知，不推定为 0/0
+    assert gts[(20, "G", "GA")] == "0/0"    # 显式 0/0 原样保留
+
+    status, job2 = upload("sample2.vcf")
+    show("16. 上传第二个单样本 VCF（样本 NA002，GT 不同）", status, job2)
+
+    status, pub2 = req("POST", f"/datasets/{DATASET_ID}/publish",
+                       {"job_id": job2["id"], "expected_version": 1})
+    show("17. 发布 v1 -> v2", status, pub2)
+
+    status, d2 = req("GET", f"/datasets/{DATASET_ID}")
+    show("18. 查询 v2：样本名与 GT 已整体切换为 NA002 的版本", status,
+         {"version": d2["version"], "sample_name": d2["sample_name"],
+          "variants": d2["variants"]})
+    gts2 = {(v["pos"], v["ref"], v["alt"]): v["gt"] for v in d2["variants"]}
+    assert d2["sample_name"] == "NA002" and gts2[(4, "G", "GTA")] == "1/1"
+
+    status, job3 = upload("gt_conflict.vcf")
+    show("19. 上传 GT 冲突 VCF（同一位点 0/1 与 1/1）：整项任务失败", status, job3)
+    assert job3["status"] == "failed" and "GT 冲突" in job3["errors"][0]["reason"]
+
+    status, rejected = req("POST", f"/datasets/{DATASET_ID}/publish",
+                           {"job_id": job3["id"], "expected_version": 2})
+    show("20. 发布冲突任务：应 422，旧版（NA002）不变", status, rejected)
+    assert status == 422
+
+    status, d3 = req("GET", f"/datasets/{DATASET_ID}")
+    show("21. 最终查询：仍为 v2 / NA002，冲突任务未造成任何改动", status,
+         {"version": d3["version"], "sample_name": d3["sample_name"]})
+    assert d3["version"] == 2 and d3["sample_name"] == "NA002"
+    print("\n基因型演示完成：GT 已归并/归一，冲突任务失败且未影响已发布数据。")
+
+
 if __name__ == "__main__":
     DATASET_ID = None
     main()
+    demo_genotype()

@@ -1,0 +1,11 @@
+##fileformat=VCFv4.2
+##contig=<ID=chr1,length=40>
+##source=sample1
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	NA001
+chr1	6	.	A	ATA	50	PASS	BATCH=1	GT	0/1
+chr1	8	.	A	ATA	50	PASS	BATCH=1	GT	1/0
+chr1	6	.	ATA	A	50	PASS	BATCH=1	GT	1/1
+chr1	17	.	A	G	50	PASS	BATCH=1	GT	0/1
+chr1	18	.	TT	GT	50	PASS	BATCH=1	GT	./.
+chr1	20	.	G	GA	50	PASS	BATCH=1	GT	0/0

@@ -1,0 +1,8 @@
+##fileformat=VCFv4.2
+##contig=<ID=chr1,length=40>
+##source=gt-conflict
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	NA001
+chr1	6	.	A	ATA	50	PASS	BAD=gt-het	GT	0/1
+chr1	8	.	A	ATA	50	PASS	BAD=gt-hom-alt	GT	1/1
+chr1	17	.	A	G	50	PASS	OK=1	GT	0/1

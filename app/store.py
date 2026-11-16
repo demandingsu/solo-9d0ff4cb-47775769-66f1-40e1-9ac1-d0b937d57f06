@@ -1,11 +1,15 @@
 """SQLite 存储层。
 
 数据模型：
-- datasets：数据集，version 从 0 起，每次成功发布 +1；
+- datasets：数据集，version 从 0 起，每次成功发布 +1；sample_name 为当前
+  已发布版本的样本名（无样本 VCF 或未发布时为 NULL），随版本一起切换；
 - jobs / job_variants：上传处理后的暂存结果（不影响已发布数据）；
 - variants：当前已发布的归一化位点（查询只读这张表）。
 
-发布语义：单事务内校验 expected_version 并整体替换 variants，
+job_variants.gt / variants.gt：二倍体基因型（0/0、0/1、1/1；1/0 已归一为
+0/1）；NULL 表示未知（无样本列上传、源行 ./. 或旧版本数据），不会推定为 0/0。
+
+发布语义：单事务内校验 expected_version 并整体替换 variants、切换样本名，
 版本不匹配或任务含坏行时回滚，已发布数据保持不变。
 """
 from __future__ import annotations
@@ -21,6 +25,7 @@ CREATE TABLE IF NOT EXISTS datasets (
     name             TEXT NOT NULL,
     version          INTEGER NOT NULL DEFAULT 0,
     published_job_id INTEGER,
+    sample_name      TEXT,
     created_at       TEXT NOT NULL,
     updated_at       TEXT NOT NULL
 );
@@ -31,6 +36,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     status        TEXT NOT NULL CHECK (status IN ('ready', 'failed')),
     fasta_name    TEXT NOT NULL,
     vcf_name      TEXT NOT NULL,
+    sample_name   TEXT,
     chrom         TEXT,
     total_records INTEGER NOT NULL,
     bad_count     INTEGER NOT NULL,
@@ -45,6 +51,7 @@ CREATE TABLE IF NOT EXISTS job_variants (
     pos        INTEGER NOT NULL,
     ref        TEXT NOT NULL,
     alt        TEXT NOT NULL,
+    gt         TEXT,
     lines_json TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_job_variants_job ON job_variants(job_id);
@@ -55,10 +62,20 @@ CREATE TABLE IF NOT EXISTS variants (
     pos        INTEGER NOT NULL,
     ref        TEXT NOT NULL,
     alt        TEXT NOT NULL,
+    gt         TEXT,
     lines_json TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_variants_dataset ON variants(dataset_id);
 """
+
+# 旧版本库缺少的列（在线迁移：ALTER TABLE ADD COLUMN，旧行该列为 NULL，
+# 查询时 NULL gt 即“未知”，NULL sample_name 即“无样本”）
+MIGRATIONS = {
+    "datasets": ["sample_name TEXT"],
+    "jobs": ["sample_name TEXT"],
+    "job_variants": ["gt TEXT"],
+    "variants": ["gt TEXT"],
+}
 
 
 def _utcnow() -> str:
@@ -93,9 +110,19 @@ class Store:
         conn = self._connect()
         try:
             conn.executescript(SCHEMA)
+            self._migrate(conn)
             conn.execute("PRAGMA journal_mode=WAL")  # 写事务期间允许并发读旧版本
         finally:
             conn.close()
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """为旧版本库补齐新增列（幂等）；旧行新列为 NULL。"""
+        for table, columns in MIGRATIONS.items():
+            existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+            for column in columns:
+                if column.split()[0] not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column}")
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=30, check_same_thread=False, isolation_level=None)
@@ -134,7 +161,7 @@ class Store:
             if row is None:
                 return None
             vrows = conn.execute(
-                "SELECT chrom, pos, ref, alt, lines_json FROM variants "
+                "SELECT chrom, pos, ref, alt, gt, lines_json FROM variants "
                 "WHERE dataset_id = ? ORDER BY pos, ref, alt",
                 (dataset_id,),
             ).fetchall()
@@ -153,6 +180,7 @@ class Store:
         dataset_id: int,
         fasta_name: str,
         vcf_name: str,
+        sample_name: str | None,
         chrom: str,
         total_records: int,
         errors: list,
@@ -167,14 +195,15 @@ class Store:
             if conn.execute("SELECT 1 FROM datasets WHERE id = ?", (dataset_id,)).fetchone() is None:
                 raise NotFoundError(f"数据集 {dataset_id} 不存在")
             cur = conn.execute(
-                "INSERT INTO jobs (dataset_id, status, fasta_name, vcf_name, chrom, "
+                "INSERT INTO jobs (dataset_id, status, fasta_name, vcf_name, sample_name, chrom, "
                 "total_records, bad_count, errors_json, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     dataset_id,
                     status,
                     fasta_name,
                     vcf_name,
+                    sample_name,
                     chrom,
                     total_records,
                     len(errors),
@@ -185,9 +214,9 @@ class Store:
             job_id = cur.lastrowid
             if status == "ready":
                 conn.executemany(
-                    "INSERT INTO job_variants (job_id, chrom, pos, ref, alt, lines_json) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    [(job_id, chrom, v.pos, v.ref, v.alt, json.dumps(v.lines)) for v in variants],
+                    "INSERT INTO job_variants (job_id, chrom, pos, ref, alt, gt, lines_json) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [(job_id, chrom, v.pos, v.ref, v.alt, v.gt, json.dumps(v.lines)) for v in variants],
                 )
             conn.commit()
         except Exception:
@@ -210,7 +239,7 @@ class Store:
             variants = None
             if row["status"] == "ready":
                 vrows = conn.execute(
-                    "SELECT pos, ref, alt, lines_json FROM job_variants "
+                    "SELECT pos, ref, alt, gt, lines_json FROM job_variants "
                     "WHERE job_id = ? ORDER BY pos, ref, alt",
                     (job_id,),
                 ).fetchall()
@@ -249,14 +278,15 @@ class Store:
 
             conn.execute("DELETE FROM variants WHERE dataset_id = ?", (dataset_id,))
             conn.execute(
-                "INSERT INTO variants (dataset_id, chrom, pos, ref, alt, lines_json) "
-                "SELECT ?, chrom, pos, ref, alt, lines_json FROM job_variants WHERE job_id = ?",
+                "INSERT INTO variants (dataset_id, chrom, pos, ref, alt, gt, lines_json) "
+                "SELECT ?, chrom, pos, ref, alt, gt, lines_json FROM job_variants WHERE job_id = ?",
                 (dataset_id, job_id),
             )
+            # 位点、GT 与样本名在同一事务内随版本一起切换
             cur = conn.execute(
-                "UPDATE datasets SET version = version + 1, published_job_id = ?, updated_at = ? "
-                "WHERE id = ? AND version = ?",
-                (job_id, _utcnow(), dataset_id, expected_version),
+                "UPDATE datasets SET version = version + 1, published_job_id = ?, sample_name = ?, "
+                "updated_at = ? WHERE id = ? AND version = ?",
+                (job_id, job["sample_name"], _utcnow(), dataset_id, expected_version),
             )
             if cur.rowcount != 1:  # 持写锁期间理论上不会发生，兜底
                 raise VersionConflictError(expected_version)
@@ -286,6 +316,7 @@ class Store:
             "name": row["name"],
             "version": row["version"],
             "published_job_id": row["published_job_id"],
+            "sample_name": row["sample_name"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
@@ -296,6 +327,7 @@ class Store:
             "pos": row["pos"],
             "ref": row["ref"],
             "alt": row["alt"],
+            "gt": row["gt"],
             "lines": json.loads(row["lines_json"]),
         }
 
@@ -307,6 +339,7 @@ class Store:
             "status": row["status"],
             "fasta_name": row["fasta_name"],
             "vcf_name": row["vcf_name"],
+            "sample_name": row["sample_name"],
             "chrom": row["chrom"],
             "total_records": row["total_records"],
             "bad_count": row["bad_count"],
